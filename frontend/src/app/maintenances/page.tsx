@@ -1,26 +1,52 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useEffect, useState, useSyncExternalStore } from 'react';
 import { useRouter } from 'next/navigation';
 import { apiRequest } from '@/lib/api';
-import { Maintenance, MaintenancePayload } from '@/types/maintenance';
+import {
+  ItemSummary,
+  Maintenance,
+  MaintenancePayload,
+  PaginatedMaintenanceResponse,
+} from '@/types/maintenance';
 
-interface ItemSummary {
-  itemName: string;
-  lastServiceDate: string;
-  lastServiceType: string;
-  totalCost: number;
-  count: number;
+const ITEMS_PER_PAGE = 5;
+const emptySubscribe = () => () => {};
+
+function getStoredUserName(): string {
+  const storedUser = localStorage.getItem('user');
+  if (!storedUser) return '';
+  try {
+    return JSON.parse(storedUser).name || '';
+  } catch {
+    return '';
+  }
 }
 
 export default function MaintenancesPage() {
   const router = useRouter();
-  const [userName, setUserName] = useState<string>('');
+  const userName = useSyncExternalStore(
+    emptySubscribe,
+    getStoredUserName,
+    () => '',
+  );
+
   const [maintenances, setMaintenances] = useState<Maintenance[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string>('');
+  const [refreshTrigger, setRefreshTrigger] = useState<number>(0);
+
+  // Pagination & Filter states
+  const [page, setPage] = useState<number>(1);
+  const [totalPages, setTotalPages] = useState<number>(1);
+  const [filteredTotal, setFilteredTotal] = useState<number>(0);
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [selectedItemFilter, setSelectedItemFilter] = useState<string>('ALL');
+
+  // Summary states
+  const [totalCost, setTotalCost] = useState<number>(0);
+  const [totalRecords, setTotalRecords] = useState<number>(0);
+  const [itemSummaries, setItemSummaries] = useState<ItemSummary[]>([]);
 
   // Form states
   const [editingId, setEditingId] = useState<number | null>(null);
@@ -32,25 +58,6 @@ export default function MaintenancesPage() {
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState('');
 
-  const fetchMaintenances = useCallback(async () => {
-    setLoading(true);
-    setError('');
-    try {
-      const data = await apiRequest<Maintenance[]>('/maintenances');
-      setMaintenances(data);
-    } catch (err: unknown) {
-      const message =
-        err instanceof Error ? err.message : 'Gagal memuat riwayat perawatan';
-      if (message.toLowerCase().includes('unauthorized')) {
-        router.replace('/login');
-        return;
-      }
-      setError(message);
-    } finally {
-      setLoading(false);
-    }
-  }, [router]);
-
   useEffect(() => {
     const token = localStorage.getItem('token');
     if (!token) {
@@ -58,17 +65,59 @@ export default function MaintenancesPage() {
       return;
     }
 
-    const storedUser = localStorage.getItem('user');
-    if (storedUser) {
-      try {
-        setUserName(JSON.parse(storedUser).name || '');
-      } catch {
-        setUserName('');
-      }
-    }
+    let isCancelled = false;
 
-    fetchMaintenances();
-  }, [router, fetchMaintenances]);
+    const loadMaintenances = async () => {
+      try {
+        const params = new URLSearchParams({
+          page: String(page),
+          limit: String(ITEMS_PER_PAGE),
+        });
+
+        if (searchQuery.trim()) {
+          params.set('search', searchQuery.trim());
+        }
+        if (selectedItemFilter !== 'ALL') {
+          params.set('item_name', selectedItemFilter);
+        }
+
+        const response = await apiRequest<PaginatedMaintenanceResponse>(
+          `/maintenances?${params.toString()}`,
+        );
+
+        if (isCancelled) return;
+        setMaintenances(response.data);
+        setTotalPages(response.meta.totalPages);
+        setFilteredTotal(response.meta.total);
+        setTotalCost(response.summary.totalCost);
+        setTotalRecords(response.summary.totalRecords);
+        setItemSummaries(response.summary.items);
+        setError('');
+      } catch (err: unknown) {
+        if (isCancelled) return;
+        const message =
+          err instanceof Error ? err.message : 'Gagal memuat riwayat perawatan';
+        if (
+          message.toLowerCase().includes('unauthorized') ||
+          message.toLowerCase().includes('akses ditolak')
+        ) {
+          router.replace('/login');
+          return;
+        }
+        setError(message);
+      } finally {
+        if (!isCancelled) {
+          setLoading(false);
+        }
+      }
+    };
+
+    void loadMaintenances();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [page, searchQuery, selectedItemFilter, refreshTrigger, router]);
 
   const resetForm = () => {
     setEditingId(null);
@@ -95,36 +144,20 @@ export default function MaintenancesPage() {
 
     try {
       if (editingId !== null) {
-        const updated = await apiRequest<Maintenance>(
-          `/maintenances/${editingId}`,
-          {
-            method: 'PATCH',
-            body: JSON.stringify(payload),
-          },
-        );
-        setMaintenances((prev) =>
-          prev
-            .map((item) => (item.id === editingId ? updated : item))
-            .sort(
-              (a, b) =>
-                new Date(b.service_date).getTime() -
-                new Date(a.service_date).getTime(),
-            ),
-        );
+        await apiRequest<Maintenance>(`/maintenances/${editingId}`, {
+          method: 'PATCH',
+          body: JSON.stringify(payload),
+        });
       } else {
-        const created = await apiRequest<Maintenance>('/maintenances', {
+        await apiRequest<Maintenance>('/maintenances', {
           method: 'POST',
           body: JSON.stringify(payload),
         });
-        setMaintenances((prev) =>
-          [created, ...prev].sort(
-            (a, b) =>
-              new Date(b.service_date).getTime() -
-              new Date(a.service_date).getTime(),
-          ),
-        );
+        setPage(1);
       }
       resetForm();
+      setLoading(true);
+      setRefreshTrigger((prev) => prev + 1);
     } catch (err: unknown) {
       const message =
         err instanceof Error ? err.message : 'Gagal menyimpan catatan servis';
@@ -153,8 +186,14 @@ export default function MaintenancesPage() {
 
     try {
       await apiRequest(`/maintenances/${id}`, { method: 'DELETE' });
-      setMaintenances((prev) => prev.filter((item) => item.id !== id));
       if (editingId === id) resetForm();
+
+      setLoading(true);
+      if (maintenances.length === 1 && page > 1) {
+        setPage((prev) => prev - 1);
+      } else {
+        setRefreshTrigger((prev) => prev + 1);
+      }
     } catch (err: unknown) {
       const message =
         err instanceof Error ? err.message : 'Gagal menghapus data';
@@ -162,66 +201,40 @@ export default function MaintenancesPage() {
     }
   };
 
-  const handleLogout = () => {
-    localStorage.removeItem('token');
-    localStorage.removeItem('user');
-    router.push('/login');
+  const handleLogout = async () => {
+    try {
+      await apiRequest('/auth/logout', { method: 'POST' });
+    } catch {
+      // Abaikan jika token sudah expired saat logout
+    } finally {
+      localStorage.removeItem('token');
+      localStorage.removeItem('refresh_token');
+      localStorage.removeItem('user');
+      router.push('/login');
+    }
   };
 
-  // Ringkasan per barang: kapan terakhir dirawat & total biaya per barang
-  const itemSummaries = useMemo<ItemSummary[]>(() => {
-    const map = new Map<string, ItemSummary>();
+  const handleSearchChange = (value: string) => {
+    setLoading(true);
+    setSearchQuery(value);
+    setPage(1);
+  };
 
-    for (const entry of maintenances) {
-      const key = entry.item_name.trim().toLowerCase();
-      const existing = map.get(key);
+  const handleItemFilterToggle = (targetItemName: string) => {
+    setLoading(true);
+    setSelectedItemFilter((prev) =>
+      prev.toLowerCase() === targetItemName.toLowerCase()
+        ? 'ALL'
+        : targetItemName,
+    );
+    setPage(1);
+  };
 
-      if (!existing) {
-        map.set(key, {
-          itemName: entry.item_name.trim(),
-          lastServiceDate: entry.service_date,
-          lastServiceType: entry.service_type,
-          totalCost: entry.cost,
-          count: 1,
-        });
-      } else {
-        existing.totalCost += entry.cost;
-        existing.count += 1;
-        if (
-          new Date(entry.service_date).getTime() >
-          new Date(existing.lastServiceDate).getTime()
-        ) {
-          existing.lastServiceDate = entry.service_date;
-          existing.lastServiceType = entry.service_type;
-        }
-      }
-    }
-
-    return Array.from(map.values());
-  }, [maintenances]);
-
-  // Filter berdasarkan barang terpilih & kata kunci pencarian
-  const filteredMaintenances = useMemo(() => {
-    const keyword = searchQuery.toLowerCase();
-    return maintenances.filter((item) => {
-      const matchesItem =
-        selectedItemFilter === 'ALL' ||
-        item.item_name.trim().toLowerCase() ===
-          selectedItemFilter.toLowerCase();
-
-      const matchesSearch =
-        item.item_name.toLowerCase().includes(keyword) ||
-        item.service_type.toLowerCase().includes(keyword) ||
-        (item.notes && item.notes.toLowerCase().includes(keyword));
-
-      return matchesItem && matchesSearch;
-    });
-  }, [maintenances, searchQuery, selectedItemFilter]);
-
-  const totalCost = useMemo(
-    () => maintenances.reduce((acc, item) => acc + item.cost, 0),
-    [maintenances],
-  );
+  const handleRetry = () => {
+    setLoading(true);
+    setError('');
+    setRefreshTrigger((prev) => prev + 1);
+  };
 
   const formatRupiah = (amount: number) =>
     new Intl.NumberFormat('id-ID', {
@@ -260,7 +273,7 @@ export default function MaintenancesPage() {
       </header>
 
       <main className="max-w-5xl mx-auto px-4 py-8 space-y-6">
-        {/* Ringkasan Total Biaya & Jumlah Servis */}
+        {/* Dashboard Ringkasan */}
         <section className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
             <p className="text-xs font-medium uppercase tracking-wider text-slate-400">
@@ -276,7 +289,7 @@ export default function MaintenancesPage() {
               Total Riwayat Servis
             </p>
             <p className="text-2xl font-bold text-slate-800 mt-1">
-              {maintenances.length} Catatan
+              {totalRecords} Catatan
             </p>
           </div>
 
@@ -299,7 +312,11 @@ export default function MaintenancesPage() {
               </h2>
               {selectedItemFilter !== 'ALL' && (
                 <button
-                  onClick={() => setSelectedItemFilter('ALL')}
+                  onClick={() => {
+                    setLoading(true);
+                    setSelectedItemFilter('ALL');
+                    setPage(1);
+                  }}
                   className="text-xs text-blue-600 font-medium hover:underline cursor-pointer"
                 >
                   Tampilkan Semua Barang
@@ -317,11 +334,7 @@ export default function MaintenancesPage() {
                   <button
                     key={summary.itemName}
                     type="button"
-                    onClick={() =>
-                      setSelectedItemFilter(
-                        isSelected ? 'ALL' : summary.itemName,
-                      )
-                    }
+                    onClick={() => handleItemFilterToggle(summary.itemName)}
                     className={`text-left p-4 rounded-xl border transition cursor-pointer ${
                       isSelected
                         ? 'bg-blue-50 border-blue-500 shadow-sm'
@@ -468,17 +481,22 @@ export default function MaintenancesPage() {
           </form>
         </section>
 
-        {/* Daftar Riwayat Perawatan */}
+        {/* Daftar Riwayat Perawatan + Pagination */}
         <section className="space-y-4">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <h2 className="text-lg font-semibold text-slate-800">
-              Riwayat Perawatan{' '}
-              {selectedItemFilter !== 'ALL' ? `— ${selectedItemFilter}` : ''}
-            </h2>
+            <div>
+              <h2 className="text-lg font-semibold text-slate-800">
+                Riwayat Perawatan{' '}
+                {selectedItemFilter !== 'ALL' ? `— ${selectedItemFilter}` : ''}
+              </h2>
+              <p className="text-xs text-slate-500">
+                Menampilkan {maintenances.length} dari {filteredTotal} catatan
+              </p>
+            </div>
             <input
               type="text"
               value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
+              onChange={(e) => handleSearchChange(e.target.value)}
               placeholder="Cari barang, jenis servis, atau catatan..."
               className="w-full sm:w-72 px-3 py-2 bg-white border border-slate-300 rounded-lg text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
             />
@@ -494,7 +512,7 @@ export default function MaintenancesPage() {
             <div className="bg-red-50 p-6 rounded-xl border border-red-200 text-center">
               <p className="text-red-600 font-medium mb-2">{error}</p>
               <button
-                onClick={fetchMaintenances}
+                onClick={handleRetry}
                 className="px-4 py-1.5 bg-red-600 text-white text-sm rounded-lg hover:bg-red-700 cursor-pointer"
               >
                 Coba Lagi
@@ -502,7 +520,7 @@ export default function MaintenancesPage() {
             </div>
           )}
 
-          {!loading && !error && filteredMaintenances.length === 0 && (
+          {!loading && !error && maintenances.length === 0 && (
             <div className="bg-white p-10 rounded-xl border border-slate-200 text-center">
               <p className="text-slate-700 font-medium">
                 {searchQuery || selectedItemFilter !== 'ALL'
@@ -517,57 +535,115 @@ export default function MaintenancesPage() {
             </div>
           )}
 
-          {!loading && !error && filteredMaintenances.length > 0 && (
-            <div className="space-y-3">
-              {filteredMaintenances.map((item) => (
-                <div
-                  key={item.id}
-                  className="bg-white p-5 rounded-xl shadow-sm border border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-4"
-                >
-                  <div className="space-y-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="px-2.5 py-0.5 text-xs font-semibold bg-blue-50 text-blue-700 rounded-full border border-blue-200">
-                        {item.item_name}
-                      </span>
-                      <h3 className="font-semibold text-slate-800">
-                        {item.service_type}
-                      </h3>
-                    </div>
+          {!loading && !error && maintenances.length > 0 && (
+            <>
+              <div className="space-y-3">
+                {maintenances.map((item) => (
+                  <div
+                    key={item.id}
+                    className="bg-white p-5 rounded-xl shadow-sm border border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-4"
+                  >
+                    <div className="space-y-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="px-2.5 py-0.5 text-xs font-semibold bg-blue-50 text-blue-700 rounded-full border border-blue-200">
+                          {item.item_name}
+                        </span>
+                        <h3 className="font-semibold text-slate-800">
+                          {item.service_type}
+                        </h3>
+                      </div>
 
-                    <p className="text-xs text-slate-500">
-                      Tanggal Servis: {formatDate(item.service_date)}
-                    </p>
-
-                    {item.notes && (
-                      <p className="text-sm text-slate-600 pt-1">
-                        Catatan: {item.notes}
+                      <p className="text-xs text-slate-500">
+                        Tanggal Servis: {formatDate(item.service_date)}
                       </p>
-                    )}
-                  </div>
 
-                  <div className="flex sm:flex-col items-center sm:items-end justify-between gap-2 border-t sm:border-t-0 pt-3 sm:pt-0">
-                    <span className="text-base font-bold text-emerald-700">
-                      {formatRupiah(item.cost)}
-                    </span>
+                      {item.notes && (
+                        <p className="text-sm text-slate-600 pt-1">
+                          Catatan: {item.notes}
+                        </p>
+                      )}
+                    </div>
 
-                    <div className="flex items-center gap-2">
-                      <button
-                        onClick={() => handleEditClick(item)}
-                        className="px-3 py-1 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-md hover:bg-amber-100 transition cursor-pointer"
-                      >
-                        Edit
-                      </button>
-                      <button
-                        onClick={() => handleDelete(item.id)}
-                        className="px-3 py-1 text-xs font-medium text-red-700 bg-red-50 border border-red-200 rounded-md hover:bg-red-100 transition cursor-pointer"
-                      >
-                        Hapus
-                      </button>
+                    <div className="flex sm:flex-col items-center sm:items-end justify-between gap-2 border-t sm:border-t-0 pt-3 sm:pt-0">
+                      <span className="text-base font-bold text-emerald-700">
+                        {formatRupiah(item.cost)}
+                      </span>
+
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => handleEditClick(item)}
+                          className="px-3 py-1 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-md hover:bg-amber-100 transition cursor-pointer"
+                        >
+                          Edit
+                        </button>
+                        <button
+                          onClick={() => handleDelete(item.id)}
+                          className="px-3 py-1 text-xs font-medium text-red-700 bg-red-50 border border-red-200 rounded-md hover:bg-red-100 transition cursor-pointer"
+                        >
+                          Hapus
+                        </button>
+                      </div>
                     </div>
                   </div>
+                ))}
+              </div>
+
+              {/* Kontrol Pagination */}
+              <div className="bg-white px-4 py-3 rounded-xl border border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-3">
+                <p className="text-xs text-slate-600">
+                  Halaman <span className="font-semibold">{page}</span> dari{' '}
+                  <span className="font-semibold">{totalPages}</span>
+                </p>
+
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    disabled={page <= 1}
+                    onClick={() => {
+                      setLoading(true);
+                      setPage((prev) => Math.max(1, prev - 1));
+                    }}
+                    className="px-3 py-1.5 text-xs font-medium rounded-lg border border-slate-300 text-slate-700 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                  >
+                    Sebelumnya
+                  </button>
+
+                  {Array.from({ length: totalPages }, (_, idx) => idx + 1).map(
+                    (pageNumber) => (
+                      <button
+                        key={pageNumber}
+                        type="button"
+                        onClick={() => {
+                          if (page !== pageNumber) {
+                            setLoading(true);
+                            setPage(pageNumber);
+                          }
+                        }}
+                        className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition cursor-pointer ${
+                          page === pageNumber
+                            ? 'bg-blue-600 text-white border-blue-600'
+                            : 'border-slate-300 text-slate-700 hover:bg-slate-50'
+                        }`}
+                      >
+                        {pageNumber}
+                      </button>
+                    ),
+                  )}
+
+                  <button
+                    type="button"
+                    disabled={page >= totalPages}
+                    onClick={() => {
+                      setLoading(true);
+                      setPage((prev) => Math.min(totalPages, prev + 1));
+                    }}
+                    className="px-3 py-1.5 text-xs font-medium rounded-lg border border-slate-300 text-slate-700 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                  >
+                    Berikutnya
+                  </button>
                 </div>
-              ))}
-            </div>
+              </div>
+            </>
           )}
         </section>
       </main>

@@ -19,11 +19,27 @@ export default function RegisterPage() {
     setLoading(true);
 
     try {
+      // 1. Daftarkan akun baru ke database
       await apiRequest('/auth/register', {
         method: 'POST',
         body: JSON.stringify({ name, email, password }),
       });
-      router.push('/login?registered=true');
+
+      // 2. Otomatis login untuk mengambil JWT access_token & refresh_token
+      const loginData = await apiRequest<{
+        access_token: string;
+        refresh_token: string;
+        user: { id: number; name: string; email: string };
+      }>('/auth/login', {
+        method: 'POST',
+        body: JSON.stringify({ email, password }),
+      });
+
+      // 3. Simpan token ke browser lalu masuk ke dashboard
+      localStorage.setItem('token', loginData.access_token);
+      localStorage.setItem('refresh_token', loginData.refresh_token);
+      localStorage.setItem('user', JSON.stringify(loginData.user));
+      router.push('/maintenances');
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Gagal mendaftar';
       setError(message);
