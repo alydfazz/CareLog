@@ -14,10 +14,10 @@ export declare class AuthService {
     register(dto: RegisterDto): Promise<{
         message: string;
         user: {
-            name: string;
             email: string;
-            createdAt: Date;
+            name: string;
             id: number;
+            createdAt: Date;
         };
     }>;
     login(dto: LoginDto): Promise<{
